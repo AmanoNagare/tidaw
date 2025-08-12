@@ -1,5 +1,4 @@
 @import "tailwindcss";
-<<<<<<< HEAD
 
 /* Base styles */
 * {
@@ -41,5 +40,3 @@ code {
 ::-webkit-scrollbar-thumb:hover {
   background: linear-gradient(135deg, #2563eb, #7c3aed);
 }
-=======
->>>>>>> 2998c5ed6cd5ce0a809d05c25e0da188666b2b51

@@ -8,11 +8,11 @@ interface TLObject {
   option: TLObjectOption[] | null; //オプション
 }
 
-interface Property {}
+// interface Property {}
 
 interface TLLayer {
   objects: TLObject[];
-  property: Property;
+  // property: Property;
 }
 
 export interface TimeLine {
