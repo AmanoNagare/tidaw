@@ -11,5 +11,10 @@ export default defineConfig({
     fs: {
       allow: [".."],
     },
+    // These headers are required for SharedArrayBuffer to work.
+    headers: {
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    },
   },
 });
