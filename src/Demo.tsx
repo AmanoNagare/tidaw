@@ -1,5 +1,6 @@
 import * as React from "react";
 import { ShareableMap } from "shared-memory-datastructures";
+import { ongen } from "./Demo.ongenmanager";
 
 // デモ用のシンプルなオーディオプレーヤー
 export default function App() {
@@ -63,7 +64,6 @@ export default function App() {
 				<button
 					className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700"
 					onClick={async () => {
-						// まるでワーカースレッドに共有するように TransferableState の状態へ変換しておく
 						await setupAudio();
 						setSetup(true);
 					}}
@@ -74,7 +74,8 @@ export default function App() {
 			<button
 				className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
 				onClick={() => {
-					audioStuff.current.sharedState.set("isPlaying", playing ? 0 : 1);
+					const sineWaveActive = ongen.sineWaveOscillator.parameters[2];
+					audioStuff.current.sharedState.set(sineWaveActive, playing ? 0 : 1);
 					setPlaying(!playing);
 				}}
 			>
@@ -89,7 +90,8 @@ export default function App() {
 				onChange={(e) => {
 					const v = Number(e.target.value);
 					setFrequency(v);
-					audioStuff.current.sharedState.set("frequency", v);
+					const sineWaveFrequency = ongen.sineWaveOscillator.parameters[0];
+					audioStuff.current.sharedState.set(sineWaveFrequency, v);
 				}}
 			/>
 			<span className="text-white">{frequency}</span>
