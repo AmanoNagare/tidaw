@@ -1,5 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import PianoRoll, { type Note } from "./daw/Piano";
+import { ShareableMap } from "shared-memory-datastructures";
+import { ongen } from "./Demo.ongenmanager";
+import rawNotes from "./daw/melodies.json"; // typed as any by default
+import NotesJsonViewer from "./NotesJsonViewer";
 
 // Basic resizable 3-way split layout:
 //  - Fixed height top bar
@@ -26,8 +30,91 @@ const App: React.FC = () => {
 		return stored ? parseFloat(stored) : 300;
 	});
 
-	// Transport / playback simple state (play/pause only placeholder)
+	// Transport / playback state
 	const [isPlaying, setIsPlaying] = useState(false);
+	const [playheadSeconds, setPlayheadSeconds] = useState(0); // UI state (mirrors shared)
+	// Currently sounding note id (for lightweight highlighting without per-frame list rerender)
+	const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
+	const BPM = 120; // simple constant tempo (future: make adjustable)
+
+	// Melody data
+	type RawNote = { pitch: number; start: number; length: number };
+	const [notes, setNotes] = useState<Note[]>(() =>
+		(rawNotes as RawNote[]).map((v) => ({
+			id: crypto.randomUUID(),
+			pitch: Number(v.pitch),
+			start: Number(v.start),
+			length: Number(v.length),
+		}))
+	);
+	// Derived maximum beat for seek bar (add small tail padding)
+	const maxEndBeat = notes.reduce((m, n) => Math.max(m, n.start + n.length), 0);
+
+	// Audio / shared memory refs (mirrors Demo.tsx but embedded here)
+	const audioStuff = useRef<{
+		worker: Worker | null;
+		sharedState: ShareableMap<string, number | string>;
+		transportState: ShareableMap<string, number>; // playhead etc.
+		audioContext: AudioContext | null;
+		setupDone: boolean;
+	}>({
+		worker: null,
+		sharedState: new ShareableMap<string, number | string>(),
+		transportState: new ShareableMap<string, number>(),
+		audioContext: null,
+		setupDone: false,
+	});
+
+	const ensureAudioSetup = useCallback(async () => {
+		if (audioStuff.current.setupDone) return;
+		const ctx = new (window.AudioContext ||
+			// @ts-expect-error safari
+			window.webkitAudioContext)();
+		audioStuff.current.audioContext = ctx;
+		const sampleRate = ctx.sampleRate;
+		const bufferSize = sampleRate * 0.1 * 2; // 0.1s * 2ch
+		const sab = new SharedArrayBuffer(
+			bufferSize * Float32Array.BYTES_PER_ELEMENT
+		);
+		const pointersSAB = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+		await ctx.audioWorklet.addModule(
+			new URL("./Demo.workletmodule.ts", import.meta.url)
+		);
+		const workletNode = new AudioWorkletNode(ctx, "demo-processor", {
+			processorOptions: { sab, pointersSAB },
+			numberOfOutputs: 1,
+			outputChannelCount: [2],
+		});
+		workletNode.connect(ctx.destination);
+		const worker = new Worker(new URL("./Demo.worker.ts", import.meta.url), {
+			type: "module",
+		});
+		worker.postMessage({
+			sab,
+			sampleRate,
+			sharedMemory: audioStuff.current.sharedState.toTransferableState(),
+			pointersSAB,
+		});
+		// Initialize default oscillator params
+		const sineWaveFrequency = ongen.sineWaveOscillator.parameters[0];
+		const sineWaveAmplitude = ongen.sineWaveOscillator.parameters[1];
+		const sineWaveActive = ongen.sineWaveOscillator.parameters[2];
+		audioStuff.current.sharedState.set(sineWaveFrequency, 440);
+		audioStuff.current.sharedState.set(sineWaveAmplitude, 0);
+		audioStuff.current.sharedState.set(sineWaveActive, 0);
+		audioStuff.current.worker = worker;
+		audioStuff.current.setupDone = true;
+	}, []);
+
+	// Persist notes JSON into shared state whenever they change (for potential worker-side usage later)
+	useEffect(() => {
+		if (!audioStuff.current.setupDone) return; // still store once setup
+		try {
+			audioStuff.current.sharedState.set("notesJson", JSON.stringify(notes));
+		} catch {
+			/* ignore */
+		}
+	}, [notes]);
 
 	// Volume (0..1) and pitch shift (-12..12 semitones) shared state
 	const [volume, setVolume] = useState<number>(() => {
@@ -46,13 +133,120 @@ const App: React.FC = () => {
 		localStorage.setItem("control:pitchShift", String(pitchShift));
 	}, [pitchShift]);
 
-	// Melody data (shared parent state). Notes: id, pitch (MIDI), start (beats), length (beats)
-	const [notes, setNotes] = useState<Note[]>(() => [
-		// Example starter motif
-		{ id: crypto.randomUUID(), pitch: 60, start: 0, length: 1 }, // C4
-		{ id: crypto.randomUUID(), pitch: 62, start: 1, length: 1 }, // D4
-		{ id: crypto.randomUUID(), pitch: 64, start: 2, length: 2 }, // E4
-	]);
+	// Scheduling refs
+	const playbackStartRef = useRef<number | null>(null);
+	const triggeredRef = useRef<Set<string>>(new Set());
+	const activeNoteRef = useRef<Note | null>(null);
+	const lastDisplayedRef = useRef(0); // throttle UI playhead state updates
+
+	// Convert MIDI to frequency
+	const midiToFreq = (midi: number) => 440 * Math.pow(2, (midi - 69) / 12);
+
+	// Main playhead + scheduler loop
+	useEffect(() => {
+		if (!isPlaying) return;
+		let raf: number;
+		let stopped = false;
+		const sortedNotes = [...notes].sort((a, b) => a.start - b.start);
+		const loop = () => {
+			if (stopped) return;
+			const now = performance.now();
+			if (playbackStartRef.current == null) playbackStartRef.current = now;
+			const elapsedMs = now - playbackStartRef.current;
+			const secs = elapsedMs / 1000;
+			const currentBeat = secs * (BPM / 60);
+			// Throttle UI playhead state updates (~30fps)
+			if (secs - lastDisplayedRef.current >= 1 / 30) {
+				lastDisplayedRef.current = secs;
+				setPlayheadSeconds(secs);
+				try {
+					audioStuff.current.transportState.set("playheadSeconds", secs);
+				} catch {
+					/* ignore */
+				}
+			}
+
+			// Trigger any notes whose start has been reached and not yet triggered
+			for (const n of sortedNotes) {
+				if (!triggeredRef.current.has(n.id) && currentBeat >= n.start) {
+					triggeredRef.current.add(n.id);
+					activeNoteRef.current = n;
+					setActiveNoteId(n.id);
+					const freqKey = ongen.sineWaveOscillator.parameters[0];
+					const ampKey = ongen.sineWaveOscillator.parameters[1];
+					const activeKey = ongen.sineWaveOscillator.parameters[2];
+					const baseFreq = midiToFreq(n.pitch);
+					const shifted = baseFreq * Math.pow(2, pitchShift / 12);
+					const amp = 0.5 * volume;
+					if (audioStuff.current.setupDone) {
+						audioStuff.current.sharedState.set(freqKey, shifted);
+						audioStuff.current.sharedState.set(ampKey, amp);
+						audioStuff.current.sharedState.set(activeKey, 1);
+					}
+				}
+			}
+			// Handle release
+			if (activeNoteRef.current) {
+				const n = activeNoteRef.current;
+				const endBeat = n.start + n.length;
+				if (currentBeat >= endBeat) {
+					const ampKey = ongen.sineWaveOscillator.parameters[1];
+					const activeKey = ongen.sineWaveOscillator.parameters[2];
+					if (audioStuff.current.setupDone) {
+						audioStuff.current.sharedState.set(ampKey, 0);
+						audioStuff.current.sharedState.set(activeKey, 0);
+					}
+					activeNoteRef.current = null;
+					setActiveNoteId(null);
+				}
+			}
+			raf = requestAnimationFrame(loop);
+		};
+		raf = requestAnimationFrame(loop);
+		return () => {
+			stopped = true;
+			cancelAnimationFrame(raf);
+		};
+	}, [isPlaying, notes, pitchShift, volume]);
+
+	// On play toggled (resume from current playhead position)
+	const togglePlay = useCallback(async () => {
+		if (!isPlaying) {
+			await ensureAudioSetup();
+			triggeredRef.current.clear();
+			activeNoteRef.current = null;
+			playbackStartRef.current = performance.now() - playheadSeconds * 1000;
+			const currentBeat = playheadSeconds * (BPM / 60);
+			for (const n of notes)
+				if (n.start < currentBeat) triggeredRef.current.add(n.id);
+		} else {
+			// Pausing: force oscillator off immediately
+			const ampKey = ongen.sineWaveOscillator.parameters[1];
+			const activeKey = ongen.sineWaveOscillator.parameters[2];
+			if (audioStuff.current.setupDone) {
+				audioStuff.current.sharedState.set(ampKey, 0);
+				audioStuff.current.sharedState.set(activeKey, 0);
+			}
+			activeNoteRef.current = null;
+			setActiveNoteId(null);
+		}
+		setIsPlaying((p) => !p);
+	}, [isPlaying, ensureAudioSetup, playheadSeconds, notes]);
+
+	// Seek to beat helper (updates internal scheduling state)
+	const seekToBeat = useCallback(
+		(beat: number) => {
+			const secs = (beat * 60) / BPM;
+			setPlayheadSeconds(secs);
+			triggeredRef.current.clear();
+			activeNoteRef.current = null;
+			playbackStartRef.current = performance.now() - secs * 1000;
+			for (const n of notes) if (n.start < beat) triggeredRef.current.add(n.id);
+		},
+		[notes]
+	);
+
+	// If user edits notes mid-play we won't rewind old triggers; future improvement.
 
 	// Persist sizes
 	useEffect(() => {
@@ -166,13 +360,34 @@ const App: React.FC = () => {
 					<button
 						className="px-4 py-2 text-sm font-semibold tracking-wide bg-[#faecea] hover:bg-[#f7dedb] active:bg-[#f2ceca] border border-black/20 text-[#442522] select-none"
 						style={{ boxShadow: "0 1px 0 rgba(0,0,0,0.15)" }}
-						onClick={() => setIsPlaying((p) => !p)}
+						onClick={togglePlay}
 					>
 						{isPlaying ? "Pause" : "Play"}
 					</button>
-					<div className="text-xs font-mono text-[#66413d] opacity-70">
-						{isPlaying ? "Playing" : "Stopped"}
-					</div>
+					{(() => {
+						const seekTotalBeats = Math.max(8, Math.ceil(maxEndBeat + 4));
+						return (
+							<div className="flex flex-col gap-1 text-xs font-mono text-[#66413d] opacity-80 min-w-[260px]">
+								<div className="flex items-center justify-between">
+									<span>{isPlaying ? "Playing" : "Stopped"}</span>
+									<span>{playheadSeconds.toFixed(2)}s</span>
+									<span>Beat {(playheadSeconds * (BPM / 60)).toFixed(2)}</span>
+								</div>
+								<div className="flex items-center gap-2">
+									<input
+										type="range"
+										min={0}
+										max={seekTotalBeats}
+										step={0.01}
+										value={playheadSeconds * (BPM / 60)}
+										onChange={(e) => seekToBeat(parseFloat(e.target.value))}
+										className="flex-1 accent-[#d66] cursor-pointer"
+									/>
+									<span className="w-10 text-right">{seekTotalBeats}</span>
+								</div>
+							</div>
+						);
+					})()}
 				</div>
 			</div>
 			<div className="flex flex-1 min-h-0 relative">
@@ -191,7 +406,16 @@ const App: React.FC = () => {
 				>
 					<div className="flex-1 min-h-0 overflow-hidden">
 						<div className="h-full w-full overflow-hidden flex flex-col">
-							<PianoRoll notes={notes} onChange={setNotes} />
+							<PianoRoll
+								notes={notes}
+								onChange={setNotes}
+								playheadBeat={playheadSeconds * (BPM / 60)}
+								onSeekRequest={(beat) => {
+									// clamp negative and large seeks
+									const safe = Math.max(0, beat);
+									seekToBeat(safe);
+								}}
+							/>
 						</div>
 					</div>
 				</div>
@@ -255,10 +479,15 @@ const App: React.FC = () => {
 					>
 						<div className="absolute inset-0 opacity-40 pointer-events-none bg-[repeating-linear-gradient(90deg,#0003_0_2px,transparent_2px_4px)]" />
 					</div>
-					<div className="flex-1 min-h-0 overflow-auto border border-black/10 bg-[#f8f1d6] flex flex-col p-3 gap-2">
-						<div className="font-mono text-[11px] leading-tight whitespace-pre overflow-auto max-h-auto">
-							{JSON.stringify(notes, null, 2)}
-						</div>
+					<div className="flex-1 min-h-0 overflow-hidden border border-black/10 bg-[#f8f1d6] flex flex-col p-2">
+						<NotesJsonViewer
+							notes={notes}
+							activeNoteId={activeNoteId}
+							isPlaying={isPlaying}
+							onSeek={(beat) => seekToBeat(beat)}
+							bpm={BPM}
+							pitchShift={pitchShift}
+						/>
 					</div>
 				</div>
 			</div>

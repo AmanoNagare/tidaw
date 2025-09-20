@@ -19,6 +19,10 @@ export interface PianoRollProps {
 	initialBeats?: number;
 	/** Pixels per beat (acts as a zoom level). */
 	beatWidth?: number;
+	/** Current playhead position in beats (optional). */
+	playheadBeat?: number;
+	/** Optional callback to request external seek when user wheel-scrolls. */
+	onSeekRequest?: (beat: number) => void;
 }
 
 // Helper constants
@@ -28,10 +32,12 @@ const isBlack = (semi: number) => !WHITE_KEYS.includes(semi % 12);
 export const PianoRoll: React.FC<PianoRollProps> = ({
 	notes,
 	onChange,
-	basePitch = 60, // C4
+	basePitch = 40, // C4
 	octaves = 3,
 	initialBeats = 16,
 	beatWidth = 48,
+	playheadBeat,
+	onSeekRequest,
 }) => {
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const rowHeight = 20; // px per semitone row
@@ -56,6 +62,8 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
 	const highest = basePitch + totalSemis - 1;
 	const pianoRef = useRef<HTMLDivElement | null>(null);
 	const gridRef = useRef<HTMLDivElement | null>(null);
+	const playheadRef = useRef<HTMLDivElement | null>(null);
+	const playheadDragRef = useRef<null | { grabbing: boolean }>(null);
 	const [dragging, setDragging] = useState<null | {
 		mode: "create" | "move";
 		noteId?: string;
@@ -159,6 +167,98 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
 		onChange(notes.filter((n) => n.id !== id));
 	};
 
+	// Keep playhead element aligned during scroll when active
+	useEffect(() => {
+		if (!gridRef.current || !playheadRef.current) return;
+		if (playheadBeat == null) return;
+		const x = playheadBeat * beatWidth;
+		playheadRef.current.style.transform = `translateX(${x}px)`;
+		// Auto-scroll: if playhead is beyond right edge, reposition so it appears ~10% from left
+		const g = gridRef.current;
+		const leftVisible = g.scrollLeft;
+		const rightVisible = leftVisible + g.clientWidth;
+		if (x > rightVisible - 20) {
+			const target = Math.max(0, x - g.clientWidth * 0.1);
+			g.scrollTo({ left: target });
+		}
+	}, [playheadBeat, beatWidth]);
+
+	// Drag handlers for playhead
+	useEffect(() => {
+		if (!gridRef.current || !onSeekRequest) return;
+		const g = gridRef.current;
+		function onMove(e: PointerEvent) {
+			if (!playheadDragRef.current?.grabbing) return;
+			const rect = g.getBoundingClientRect();
+			const x = e.clientX - rect.left + g.scrollLeft;
+			const beat = x / beatWidth;
+			onSeekRequest?.(Math.max(0, beat));
+		}
+		function onUp() {
+			if (playheadDragRef.current) playheadDragRef.current.grabbing = false;
+			document.body.style.cursor = "";
+			document.body.style.userSelect = "";
+		}
+		window.addEventListener("pointermove", onMove);
+		window.addEventListener("pointerup", onUp);
+		return () => {
+			window.removeEventListener("pointermove", onMove);
+			window.removeEventListener("pointerup", onUp);
+		};
+	}, [onSeekRequest, beatWidth]);
+
+	// Wheel seek: horizontal (shift+wheel OR trackpad), vertical wheel maps to +/- beats
+	const handleWheel = (e: React.WheelEvent) => {
+		if (!onSeekRequest) return;
+		if (playheadBeat == null) return;
+		// Prevent the container from scrolling vertically (we only have horizontal anyway)
+		e.preventDefault();
+		// Determine delta beats. Use wheel deltaX or deltaY depending on gesture.
+		const deltaPx =
+			Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+		// Invert so wheel down moves forward
+		const direction = deltaPx > 0 ? 1 : -1;
+		const magnitude = Math.min(240, Math.abs(deltaPx));
+		// Scale: 120 wheel units ~ 1 beat (tweakable)
+		const deltaBeats = (magnitude / 120) * direction;
+		const next = Math.max(0, playheadBeat + deltaBeats);
+		onSeekRequest(next);
+	};
+
+	// Looping: when the external playhead (playheadBeat) passes the end of all notes,
+	// automatically wrap back to 0. We consider the melody end to be the maximum end
+	// (start + length) of any note. Add a small epsilon so floating point rounding
+	// during playback doesn't prematurely trigger the loop.
+	const lastNoteEnd = useMemo(
+		() => notes.reduce((m, n) => Math.max(m, n.start + n.length), 0),
+		[notes]
+	);
+	const loopGuardRef = useRef<number | null>(null);
+	useEffect(() => {
+		if (!onSeekRequest) return; // no seeking possible
+		if (playheadBeat == null) return; // no playhead being driven
+		if (lastNoteEnd <= 0) return; // nothing to loop
+		// Only loop if we've genuinely passed (>) the end.
+		const epsilon = 1e-4;
+		if (playheadBeat > lastNoteEnd + epsilon) {
+			// Guard against spamming seek requests if parent updates are asynchronous.
+			if (
+				loopGuardRef.current === null ||
+				playheadBeat > loopGuardRef.current
+			) {
+				loopGuardRef.current = playheadBeat; // record the point we looped from
+				onSeekRequest(0);
+				// Scroll viewport back to beginning so user immediately sees restart.
+				if (gridRef.current) {
+					gridRef.current.scrollTo({ left: 0 });
+				}
+			}
+		} else if (playheadBeat < lastNoteEnd - 1) {
+			// Reset guard once we are clearly before the end again (gives a little hysteresis)
+			loopGuardRef.current = null;
+		}
+	}, [playheadBeat, lastNoteEnd, onSeekRequest]);
+
 	return (
 		<div
 			ref={containerRef}
@@ -183,9 +283,13 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
 								"flex items-center pr-1 justify-end text-[10px] font-medium box-border " +
 								(black
 									? "bg-[#5b6d82] text-white"
-									: "bg-[#f5f9ff] text-[#334255] border-y border-black/10")
+									: "bg-[#f5f9ff] text-[#334255]")
 							}
-							style={{ height: rowHeight, position: "relative" }}
+							style={{
+								height: rowHeight + 4,
+								position: "relative",
+								borderBottom: "1px solid rgba(30,55,90,0.15)",
+							}}
 						>
 							{!black && <span>{noteName(p)}</span>}
 							<button
@@ -204,7 +308,30 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
 				className="relative flex-1 overflow-x-auto overflow-y-hidden"
 				ref={gridRef}
 				onContextMenu={(e) => e.preventDefault()}
+				onWheel={handleWheel}
 			>
+				{/* Playhead overlay (positioned via transform for performance) */}
+				{playheadBeat != null && (
+					<div
+						ref={playheadRef}
+						className="absolute top-0 h-full w-px bg-red-500 z-20 group/playhead"
+						style={{ left: 0, cursor: "ew-resize" }}
+						onPointerDown={(e) => {
+							if (e.button !== 0) return;
+							playheadDragRef.current = { grabbing: true };
+							document.body.style.cursor = "ew-resize";
+							document.body.style.userSelect = "none";
+						}}
+					>
+						{/* Handle knob */}
+						<div
+							className="absolute -top-2 left-1/2 -translate-x-1/2 w-3 h-3 rounded-sm bg-red-500 shadow pointer-events-none"
+							style={{
+								boxShadow: "0 0 0 1px #fff,0 0 2px 1px rgba(0,0,0,0.4)",
+							}}
+						/>
+					</div>
+				)}
 				<div
 					style={{
 						width: totalWidth,
@@ -266,7 +393,7 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
 								onContextMenu={(e) => handleContextOnNote(e, n.id)}
 								className="absolute rounded-none text-[10px] flex items-center justify-center font-medium text-[#1e2c3d] shadow-sm"
 								style={{
-									top: y + 2,
+									top: y + 1,
 									height: rowHeight - 4,
 									left: n.start * beatWidth,
 									width: Math.max(4, n.length * beatWidth - 2),
