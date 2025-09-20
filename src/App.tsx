@@ -415,6 +415,35 @@ const App: React.FC = () => {
 									const safe = Math.max(0, beat);
 									seekToBeat(safe);
 								}}
+								onLoopReset={() => {
+									// Reset playhead to beginning AND reset the playback timer reference
+									// We need to both update the UI state AND the underlying ref that drives animation
+									const now = performance.now();
+									playbackStartRef.current = now; // Reset timer reference right now
+									lastDisplayedRef.current = 0; // Reset throttle timer
+									setPlayheadSeconds(0); // Update UI state
+
+									// Reset all note states
+									triggeredRef.current.clear();
+
+									// Turn off any currently playing notes
+									const ampKey = ongen.sineWaveOscillator.parameters[1];
+									const activeKey = ongen.sineWaveOscillator.parameters[2];
+									if (audioStuff.current.setupDone) {
+										audioStuff.current.sharedState.set(ampKey, 0);
+										audioStuff.current.sharedState.set(activeKey, 0);
+									}
+
+									activeNoteRef.current = null;
+									setActiveNoteId(null);
+
+									// Also update the transport state
+									try {
+										audioStuff.current.transportState.set("playheadSeconds", 0);
+									} catch {
+										/* ignore */
+									}
+								}}
 							/>
 						</div>
 					</div>

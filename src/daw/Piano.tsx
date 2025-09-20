@@ -23,6 +23,8 @@ export interface PianoRollProps {
 	playheadBeat?: number;
 	/** Optional callback to request external seek when user wheel-scrolls. */
 	onSeekRequest?: (beat: number) => void;
+	/** Optional callback triggered when playhead should loop back to start. If provided, this will be called instead of onSeekRequest for loop events. */
+	onLoopReset?: () => void;
 }
 
 // Helper constants
@@ -38,6 +40,7 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
 	beatWidth = 48,
 	playheadBeat,
 	onSeekRequest,
+	onLoopReset,
 }) => {
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const rowHeight = 20; // px per semitone row
@@ -235,7 +238,7 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
 	);
 	const loopGuardRef = useRef<number | null>(null);
 	useEffect(() => {
-		if (!onSeekRequest) return; // no seeking possible
+		if (!onSeekRequest && !onLoopReset) return; // no seeking possible
 		if (playheadBeat == null) return; // no playhead being driven
 		if (lastNoteEnd <= 0) return; // nothing to loop
 		// Only loop if we've genuinely passed (>) the end.
@@ -247,17 +250,25 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
 				playheadBeat > loopGuardRef.current
 			) {
 				loopGuardRef.current = playheadBeat; // record the point we looped from
-				onSeekRequest(0);
+
+				// If onLoopReset is provided, use it for proper audio reset when looping
+				if (onLoopReset) {
+					onLoopReset();
+				} else {
+					// Fall back to regular seek if no loop handler provided
+					onSeekRequest?.(0);
+				}
+
 				// Scroll viewport back to beginning so user immediately sees restart.
 				if (gridRef.current) {
 					gridRef.current.scrollTo({ left: 0 });
 				}
 			}
-		} else if (playheadBeat < lastNoteEnd - 1) {
-			// Reset guard once we are clearly before the end again (gives a little hysteresis)
+		} else if (playheadBeat < lastNoteEnd * 0.5) {
+			// Reset guard once we are clearly before the end (use percentage of total rather than fixed offset)
 			loopGuardRef.current = null;
 		}
-	}, [playheadBeat, lastNoteEnd, onSeekRequest]);
+	}, [playheadBeat, lastNoteEnd, onSeekRequest, onLoopReset]);
 
 	return (
 		<div
